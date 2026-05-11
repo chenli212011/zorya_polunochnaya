@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zorya · Chat</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="chat-app">
+
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h2>Conversations</h2>
+        <button class="btn-new" id="new-thread" title="New conversation">+ New</button>
+      </div>
+      <div class="thread-list" id="thread-list">
+        <div class="thread-list-empty">No conversations yet.</div>
+      </div>
+    </aside>
+
+    <section class="chat-pane">
+      <header class="chat-header">
+        <h1>Chat</h1>
+        <label class="pill pill-select" title="OpenAI model">
+          <select id="model" disabled><option>loading…</option></select>
+        </label>
+      </header>
+      <div class="chat-log" id="log-left" aria-live="polite"></div>
+    </section>
+
+    <section class="chat-pane">
+      <header class="chat-header">
+        <h1>Translated</h1>
+        <label class="pill pill-select" title="Target language">
+          <select id="lang" disabled><option>loading…</option></select>
+        </label>
+      </header>
+      <div class="chat-log" id="log-right" aria-live="polite"></div>
+    </section>
+
+    <form class="chat-input" id="form">
+      <textarea
+        id="input"
+        placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+        autocomplete="off"
+        autofocus
+      ></textarea>
+      <button type="submit" id="send">Send</button>
+    </form>
+  </div>
+
+  <button class="bg-toggle" id="bg-toggle" title="Change background">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.8 1.8-1.8H17c2.8 0 5-2.2 5-5 0-4.9-4.5-9-10-9z"/>
+      <circle cx="7.5" cy="11.5" r="1.2" fill="currentColor" stroke="none"/>
+      <circle cx="11" cy="6.5" r="1.2" fill="currentColor" stroke="none"/>
+      <circle cx="16" cy="7.5" r="1.2" fill="currentColor" stroke="none"/>
+      <circle cx="17.5" cy="12.5" r="1.2" fill="currentColor" stroke="none"/>
+    </svg>
+  </button>
+  <div class="bg-toast" id="bg-toast" aria-hidden="true"></div>
+
+  <script>
+    const AGENT = "chat";
+    const STORAGE_KEY = "zorya.currentThreadId";
+    const BG_KEY = "zorya.background";
+
+    // ---- background themes --------------------------------------------------
+
+    const BG_THEMES = [
+      { id: "aurora",  label: "Aurora"   },
+      { id: "ember",   label: "Ember"    },
+      { id: "forest",  label: "Forest"   },
+      { id: "sunset",  label: "Sunset"   },
+      { id: "deepsea", label: "Deep Sea" },
+    ];
+    const BG_OVERRIDES = BG_THEMES.filter((t) => t.id !== "aurora").map((t) => `bg-${t.id}`);
+
+    function applyBackground(themeId, showToast = false) {
+      for (const cls of BG_OVERRIDES) document.body.classList.remove(cls);
+      if (themeId !== "aurora") document.body.classList.add(`bg-${themeId}`);
+      localStorage.setItem(BG_KEY, themeId);
+      const theme = BG_THEMES.find((t) => t.id === themeId) ?? BG_THEMES[0];
+      const btn = document.getElementById("bg-toggle");
+      if (btn) btn.title = `Background: ${theme.label} — click to cycle`;
+      if (showToast) {
+        const toast = document.getElementById("bg-toast");
+        if (toast) {
+          toast.textContent = theme.label;
+          toast.classList.add("show");
+          clearTimeout(toast._timer);
+          toast._timer = setTimeout(() => toast.classList.remove("show"), 1400);
+        }
+      }
+    }
+
+    function cycleBackground() {
+      const current = localStorage.getItem(BG_KEY) || "aurora";
+      const idx = BG_THEMES.findIndex((t) => t.id === current);
+      const next = BG_THEMES[(idx + 1) % BG_THEMES.length];
+      applyBackground(next.id, true);
+    }
+
+    applyBackground(localStorage.getItem(BG_KEY) || "aurora");
+    document.getElementById("bg-toggle").addEventListener("click", cycleBackground);
+
+    const logLeft = document.getElementById("log-left");
+    const logRight = document.getElementById("log-right");
+    const form = document.getElementById("form");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("send");
+    const modelSelect = document.getElementById("model");
+    const langSelect = document.getElementById("lang");
+    const threadList = document.getElementById("thread-list");
+    const newThreadBtn = document.getElementById("new-thread");
+
+    /** @type {{role: "user"|"assistant", content: string}[]} */
+    let history = [];
+    let currentThreadId = localStorage.getItem(STORAGE_KEY) || null;
+    const translationCache = new Map();
+
+    // ---- bubbles ------------------------------------------------------------
+
+    function bubble(log, role, text = "") {
+      const el = document.createElement("div");
+      el.className = `msg ${role}`;
+      const r = document.createElement("span");
+      r.className = "role";
+      r.textContent = role;
+      const c = document.createElement("span");
+      c.className = "content";
+      c.textContent = text;
+      el.appendChild(r);
+      el.appendChild(c);
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+      return { el, content: c };
+    }
+
+    function showError(msg) {
+      const e = document.createElement("div");
+      e.className = "chat-error";
+      e.textContent = msg;
+      logLeft.appendChild(e);
+      logLeft.scrollTop = logLeft.scrollHeight;
+    }
+
+    function clearLogs() {
+      logLeft.innerHTML = "";
+      logRight.innerHTML = "";
+    }
+
+    // ---- translation --------------------------------------------------------
+
+    async function translate(text, target) {
+      if (!text) return "";
+      const key = `${target}::${text}`;
+      if (translationCache.has(key)) return translationCache.get(key);
+      const resp = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text, target }),
+      });
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => "");
+        throw new Error(`HTTP ${resp.status}: ${detail}`);
+      }
+      const { translated } = await resp.json();
+      translationCache.set(key, translated);
+      return translated;
+    }
+
+    async function fillTranslated(bubbleObj, text, target) {
+      bubbleObj.el.classList.add("streaming");
+      try {
+        bubbleObj.content.textContent = await translate(text, target);
+      } catch (err) {
+        bubbleObj.content.textContent = `[translation error: ${err.message}]`;
+        bubbleObj.el.classList.add("error");
+      } finally {
+        bubbleObj.el.classList.remove("streaming");
+      }
+    }
+
+    async function retranslateAll() {
+      logRight.innerHTML = "";
+      const target = langSelect.value;
+      for (const m of history) {
+        const b = bubble(logRight, m.role, "");
+        await fillTranslated(b, m.content, target);
+      }
+    }
+
+    // ---- threads ------------------------------------------------------------
+
+    function setCurrentThread(id) {
+      currentThreadId = id;
+      if (id) localStorage.setItem(STORAGE_KEY, id);
+      else localStorage.removeItem(STORAGE_KEY);
+      // update active state in sidebar
+      for (const el of threadList.querySelectorAll(".thread-item")) {
+        el.classList.toggle("active", el.dataset.threadId === id);
+      }
+    }
+
+    function renderThreadList(threads) {
+      threadList.innerHTML = "";
+      if (!threads.length) {
+        const empty = document.createElement("div");
+        empty.className = "thread-list-empty";
+        empty.textContent = "No conversations yet.";
+        threadList.appendChild(empty);
+        return;
+      }
+      for (const t of threads) {
+        const item = document.createElement("div");
+        item.className = "thread-item";
+        item.dataset.threadId = t.thread_id;
+        if (t.thread_id === currentThreadId) item.classList.add("active");
+
+        const title = document.createElement("span");
+        title.className = "title";
+        title.textContent = t.title || "(empty)";
+        item.appendChild(title);
+
+        const del = document.createElement("button");
+        del.className = "delete";
+        del.textContent = "×";
+        del.title = "Delete conversation";
+        del.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!confirm(`Delete this conversation?\n\n"${t.title}"`)) return;
+          await fetch(`/api/threads/${encodeURIComponent(t.thread_id)}`, { method: "DELETE" });
+          if (t.thread_id === currentThreadId) {
+            startNewThread();
+          }
+          await refreshThreads();
+        });
+        item.appendChild(del);
+
+        item.addEventListener("click", () => loadThread(t.thread_id));
+        threadList.appendChild(item);
+      }
+    }
+
+    async function refreshThreads() {
+      try {
+        const resp = await fetch("/api/threads");
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const { threads } = await resp.json();
+        renderThreadList(threads);
+      } catch (err) {
+        // non-fatal; sidebar just won't update
+        console.error("refreshThreads failed", err);
+      }
+    }
+
+    async function loadThread(threadId) {
+      try {
+        const resp = await fetch(`/api/threads/${encodeURIComponent(threadId)}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const { messages } = await resp.json();
+        history = messages.map((m) => ({ role: m.role, content: m.content }));
+        setCurrentThread(threadId);
+        clearLogs();
+        for (const m of history) bubble(logLeft, m.role, m.content);
+        await retranslateAll();
+      } catch (err) {
+        showError(`Could not load conversation: ${err.message}`);
+      }
+    }
+
+    function startNewThread() {
+      currentThreadId = null;
+      localStorage.removeItem(STORAGE_KEY);
+      history = [];
+      clearLogs();
+      for (const el of threadList.querySelectorAll(".thread-item")) {
+        el.classList.remove("active");
+      }
+      input.focus();
+    }
+
+    newThreadBtn.addEventListener("click", startNewThread);
+
+    // ---- loaders ------------------------------------------------------------
+
+    async function loadModels() {
+      try {
+        const resp = await fetch("/api/openai/models");
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const { models, default: defaultModel } = await resp.json();
+        modelSelect.innerHTML = "";
+        if (!models.length) {
+          modelSelect.innerHTML = `<option>${defaultModel || "no models"}</option>`;
+          return;
+        }
+        for (const m of models) {
+          const opt = document.createElement("option");
+          opt.value = m.id;
+          opt.textContent = m.id;
+          if (m.id === defaultModel) opt.selected = true;
+          modelSelect.appendChild(opt);
+        }
+        modelSelect.disabled = false;
+      } catch (err) {
+        modelSelect.innerHTML = `<option value="gpt-4o-mini">gpt-4o-mini</option>`;
+        modelSelect.disabled = false;
+        showError(`Could not load model list: ${err.message}.`);
+      }
+    }
+
+    async function loadLanguages() {
+      try {
+        const resp = await fetch("/api/translate/languages");
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const { languages } = await resp.json();
+        const want = "ru";
+
+        langSelect.innerHTML = "";
+        let matched = null;
+        for (const l of languages) {
+          const opt = document.createElement("option");
+          opt.value = l.code;
+          opt.textContent = `${l.name} (${l.code})`;
+          if (l.code === want) { opt.selected = true; matched = l.code; }
+          langSelect.appendChild(opt);
+        }
+        if (!matched && languages.length) {
+          langSelect.value = languages[0].code;
+        }
+        langSelect.disabled = false;
+      } catch (err) {
+        langSelect.innerHTML = `<option value="ru">Russian (ru)</option>`;
+        langSelect.disabled = false;
+        showError(`Could not load languages: ${err.message}.`);
+      }
+    }
+
+    langSelect.addEventListener("change", retranslateAll);
+
+    // ---- send flow ----------------------------------------------------------
+
+    async function send(text) {
+      if (!currentThreadId) {
+        currentThreadId = (crypto.randomUUID && crypto.randomUUID()) || `t-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+        localStorage.setItem(STORAGE_KEY, currentThreadId);
+      }
+      const target = langSelect.value;
+
+      history.push({ role: "user", content: text });
+      bubble(logLeft, "user", text);
+      const userRightBubble = bubble(logRight, "user", "");
+      const userTranslate = fillTranslated(userRightBubble, text, target);
+
+      const asstLeft = bubble(logLeft, "assistant", "");
+      asstLeft.el.classList.add("streaming");
+      let acc = "";
+
+      sendBtn.disabled = true;
+      const wasNewThread = history.length === 1;
+      try {
+        const resp = await fetch(`/api/agents/${AGENT}/stream?mode=messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            input: text,
+            thread_id: currentThreadId,
+            model: modelSelect.value,
+          }),
+        });
+        if (!resp.ok) {
+          const detail = await resp.text().catch(() => "");
+          throw new Error(`HTTP ${resp.status}: ${detail}`);
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const events = buf.split("\n\n");
+          buf = events.pop() ?? "";
+          for (const ev of events) {
+            const line = ev.split("\n").find((l) => l.startsWith("data: "));
+            if (!line) continue;
+            const data = line.slice(6);
+            if (data === "[DONE]") continue;
+            try {
+              const payload = JSON.parse(data);
+              if (payload.type === "token") {
+                acc += payload.content;
+                asstLeft.content.textContent = acc;
+                logLeft.scrollTop = logLeft.scrollHeight;
+              } else if (payload.type === "error") {
+                throw new Error(payload.error);
+              }
+            } catch (err) {
+              if (err instanceof SyntaxError) continue;
+              throw err;
+            }
+          }
+        }
+
+        history.push({ role: "assistant", content: acc });
+        asstLeft.el.classList.remove("streaming");
+
+        const asstRight = bubble(logRight, "assistant", "");
+        await fillTranslated(asstRight, acc, target);
+      } catch (err) {
+        showError(err.message || String(err));
+        asstLeft.el.remove();
+        userRightBubble.el.remove();
+        history.pop();
+        if (wasNewThread) {
+          // roll back the new thread_id since the request failed
+          currentThreadId = null;
+          localStorage.removeItem(STORAGE_KEY);
+        }
+      } finally {
+        asstLeft.el.classList.remove("streaming");
+        sendBtn.disabled = false;
+        input.focus();
+      }
+
+      await userTranslate;
+      refreshThreads();  // updates title / new entry in sidebar
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text || sendBtn.disabled) return;
+      input.value = "";
+      send(text);
+    });
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        form.requestSubmit();
+      }
+    });
+
+    // ---- boot ---------------------------------------------------------------
+
+    (async () => {
+      await Promise.all([loadModels(), loadLanguages(), refreshThreads()]);
+      if (currentThreadId) {
+        await loadThread(currentThreadId).catch(() => startNewThread());
+      }
+    })();
+  </script>
+</body>
+</html>

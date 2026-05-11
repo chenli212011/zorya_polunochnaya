@@ -1,0 +1,15 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-dotenv>=1.0
+
+# LangGraph + LangChain
+langgraph>=0.2.50
+langgraph-checkpoint-sqlite>=2.0
+langchain-core>=0.3
+langchain-anthropic>=0.3
+langchain-openai>=0.2
+langchain-community>=0.3
+langchain-tavily>=0.2
+
+# Translation (free Google Translate web endpoint, no key required)
+deep-translator>=1.11
