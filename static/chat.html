@@ -22,9 +22,14 @@
     <section class="chat-pane">
       <header class="chat-header">
         <h1>Chat</h1>
-        <label class="pill pill-select" title="OpenAI model">
-          <select id="model" disabled><option>loading…</option></select>
-        </label>
+        <div class="chat-header-controls">
+          <label class="pill pill-select" title="Text model (OpenAI) — used for text-only messages">
+            <select id="model" disabled><option>loading…</option></select>
+          </label>
+          <label class="pill pill-select" title="Vision model (Anthropic) — used when an image is attached">
+            <select id="vision-model"></select>
+          </label>
+        </div>
       </header>
       <div class="chat-log" id="log-left" aria-live="polite"></div>
     </section>
@@ -40,6 +45,16 @@
     </section>
 
     <form class="chat-input" id="form">
+      <button type="button" id="attach-btn" class="btn-attach" title="Attach image">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21.44 11.05l-9.19 9.19a6 6 0 1 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66l-9.2 9.19a2 2 0 1 1-2.83-2.83l8.49-8.48"/>
+        </svg>
+      </button>
+      <input type="file" id="image-input" accept="image/*" hidden>
+      <div id="image-preview" class="image-preview" hidden>
+        <img id="image-preview-img" alt="attachment preview">
+        <button type="button" id="image-clear" class="image-clear" title="Remove attachment">×</button>
+      </div>
       <textarea
         id="input"
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
@@ -74,6 +89,7 @@
       { id: "forest",  label: "Forest"   },
       { id: "sunset",  label: "Sunset"   },
       { id: "deepsea", label: "Deep Sea" },
+      { id: "dark",    label: "Dark"     },
     ];
     const BG_OVERRIDES = BG_THEMES.filter((t) => t.id !== "aurora").map((t) => `bg-${t.id}`);
 
@@ -111,27 +127,53 @@
     const input = document.getElementById("input");
     const sendBtn = document.getElementById("send");
     const modelSelect = document.getElementById("model");
+    const visionModelSelect = document.getElementById("vision-model");
     const langSelect = document.getElementById("lang");
     const threadList = document.getElementById("thread-list");
     const newThreadBtn = document.getElementById("new-thread");
+    const attachBtn = document.getElementById("attach-btn");
+    const imageInput = document.getElementById("image-input");
+    const imagePreview = document.getElementById("image-preview");
+    const imagePreviewImg = document.getElementById("image-preview-img");
+    const imageClear = document.getElementById("image-clear");
 
-    /** @type {{role: "user"|"assistant", content: string}[]} */
+    // Curated list of Anthropic vision-capable models. Edit to add newer
+    // releases (e.g. claude-sonnet-4-6, claude-opus-4-7) once your account
+    // has them enabled.
+    const VISION_MODELS = [
+      { id: "claude-haiku-4-5",  label: "Claude Haiku 4.5" },
+      { id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
+      { id: "claude-opus-4-1",   label: "Claude Opus 4.1" },
+    ];
+    const DEFAULT_VISION_MODEL = "claude-sonnet-4-5";
+    const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+    /** @type {{role: "user"|"assistant", content: string, images: string[]}[]} */
     let history = [];
     let currentThreadId = localStorage.getItem(STORAGE_KEY) || null;
+    let pendingImage = null;  // data URL of staged attachment, or null
     const translationCache = new Map();
 
     // ---- bubbles ------------------------------------------------------------
 
-    function bubble(log, role, text = "") {
+    function bubble(log, role, text = "", images = []) {
       const el = document.createElement("div");
       el.className = `msg ${role}`;
       const r = document.createElement("span");
       r.className = "role";
       r.textContent = role;
+      el.appendChild(r);
+      for (const url of images || []) {
+        const img = document.createElement("img");
+        img.src = url;
+        img.className = "msg-image";
+        img.loading = "lazy";
+        img.alt = "attachment";
+        el.appendChild(img);
+      }
       const c = document.createElement("span");
       c.className = "content";
       c.textContent = text;
-      el.appendChild(r);
       el.appendChild(c);
       log.appendChild(el);
       log.scrollTop = log.scrollHeight;
@@ -187,7 +229,7 @@
       logRight.innerHTML = "";
       const target = langSelect.value;
       for (const m of history) {
-        const b = bubble(logRight, m.role, "");
+        const b = bubble(logRight, m.role, "", m.images || []);
         await fillTranslated(b, m.content, target);
       }
     }
@@ -261,10 +303,14 @@
         const resp = await fetch(`/api/threads/${encodeURIComponent(threadId)}`);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const { messages } = await resp.json();
-        history = messages.map((m) => ({ role: m.role, content: m.content }));
+        history = messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+          images: m.images || [],
+        }));
         setCurrentThread(threadId);
         clearLogs();
-        for (const m of history) bubble(logLeft, m.role, m.content);
+        for (const m of history) bubble(logLeft, m.role, m.content, m.images);
         await retranslateAll();
       } catch (err) {
         showError(`Could not load conversation: ${err.message}`);
@@ -311,6 +357,57 @@
       }
     }
 
+    function populateVisionModels() {
+      visionModelSelect.innerHTML = "";
+      for (const m of VISION_MODELS) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.label;
+        if (m.id === DEFAULT_VISION_MODEL) opt.selected = true;
+        visionModelSelect.appendChild(opt);
+      }
+    }
+
+    // ---- image attachment ---------------------------------------------------
+
+    function clearPendingImage() {
+      pendingImage = null;
+      imageInput.value = "";
+      imagePreviewImg.src = "";
+      imagePreview.hidden = true;
+    }
+
+    function readAsDataURL(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    attachBtn.addEventListener("click", () => imageInput.click());
+
+    imageInput.addEventListener("change", async () => {
+      const file = imageInput.files && imageInput.files[0];
+      if (!file) return;
+      if (file.size > MAX_IMAGE_BYTES) {
+        showError(`Image too large: ${(file.size / 1024 / 1024).toFixed(1)} MB (max 20 MB).`);
+        imageInput.value = "";
+        return;
+      }
+      try {
+        pendingImage = await readAsDataURL(file);
+        imagePreviewImg.src = pendingImage;
+        imagePreview.hidden = false;
+      } catch (err) {
+        showError(`Could not read image: ${err.message || err}`);
+        clearPendingImage();
+      }
+    });
+
+    imageClear.addEventListener("click", clearPendingImage);
+
     async function loadLanguages() {
       try {
         const resp = await fetch("/api/translate/languages");
@@ -348,10 +445,15 @@
         localStorage.setItem(STORAGE_KEY, currentThreadId);
       }
       const target = langSelect.value;
+      const attachedImage = pendingImage;
+      const isVision = !!attachedImage;
+      const userImages = isVision ? [attachedImage] : [];
 
-      history.push({ role: "user", content: text });
-      bubble(logLeft, "user", text);
-      const userRightBubble = bubble(logRight, "user", "");
+      clearPendingImage();
+
+      history.push({ role: "user", content: text, images: userImages });
+      bubble(logLeft, "user", text, userImages);
+      const userRightBubble = bubble(logRight, "user", "", userImages);
       const userTranslate = fillTranslated(userRightBubble, text, target);
 
       const asstLeft = bubble(logLeft, "assistant", "");
@@ -361,14 +463,17 @@
       sendBtn.disabled = true;
       const wasNewThread = history.length === 1;
       try {
+        const body = {
+          input: text,
+          thread_id: currentThreadId,
+          model: isVision ? visionModelSelect.value : modelSelect.value,
+          provider: isVision ? "anthropic" : "openai",
+        };
+        if (isVision) body.images = [attachedImage];
         const resp = await fetch(`/api/agents/${AGENT}/stream?mode=messages`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            input: text,
-            thread_id: currentThreadId,
-            model: modelSelect.value,
-          }),
+          body: JSON.stringify(body),
         });
         if (!resp.ok) {
           const detail = await resp.text().catch(() => "");
@@ -405,10 +510,10 @@
           }
         }
 
-        history.push({ role: "assistant", content: acc });
+        history.push({ role: "assistant", content: acc, images: [] });
         asstLeft.el.classList.remove("streaming");
 
-        const asstRight = bubble(logRight, "assistant", "");
+        const asstRight = bubble(logRight, "assistant", "", []);
         await fillTranslated(asstRight, acc, target);
       } catch (err) {
         showError(err.message || String(err));
@@ -448,6 +553,7 @@
     // ---- boot ---------------------------------------------------------------
 
     (async () => {
+      populateVisionModels();
       await Promise.all([loadModels(), loadLanguages(), refreshThreads()]);
       if (currentThreadId) {
         await loadThread(currentThreadId).catch(() => startNewThread());

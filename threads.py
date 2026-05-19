@@ -22,13 +22,38 @@ def _role(msg) -> str:
     return "unknown"
 
 
-def _content(msg) -> str:
+def _split_content(msg) -> tuple[str, list[str]]:
+    """Return (text, image_data_urls) extracted from a message's content blocks."""
     c = getattr(msg, "content", "")
     if isinstance(c, str):
-        return c
-    return "".join(
-        block.get("text", "") if isinstance(block, dict) else str(block) for block in c
-    )
+        return c, []
+    text_parts: list[str] = []
+    images: list[str] = []
+    for block in c:
+        if not isinstance(block, dict):
+            text_parts.append(str(block))
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text_parts.append(block.get("text", ""))
+        elif btype == "image_url":
+            url_field = block.get("image_url", {})
+            url = url_field.get("url") if isinstance(url_field, dict) else str(url_field)
+            if url:
+                images.append(url)
+        elif btype == "image":
+            source = block.get("source", {}) or {}
+            if source.get("type") == "base64":
+                images.append(
+                    f"data:{source.get('media_type', 'image/jpeg')};base64,{source.get('data', '')}"
+                )
+            elif source.get("type") == "url" and source.get("url"):
+                images.append(source["url"])
+    return "".join(text_parts), images
+
+
+def _content(msg) -> str:
+    return _split_content(msg)[0]
 
 
 def _title_from_messages(messages: list) -> str:
@@ -68,13 +93,16 @@ async def get_thread(thread_id: str) -> dict:
     if not tup:
         raise HTTPException(status_code=404, detail=f"unknown thread: {thread_id}")
     messages = tup.checkpoint.get("channel_values", {}).get("messages", [])
+    out: list[dict] = []
+    for m in messages:
+        role = _role(m)
+        if role not in ("user", "assistant"):
+            continue
+        text, images = _split_content(m)
+        out.append({"role": role, "content": text, "images": images})
     return {
         "thread_id": thread_id,
-        "messages": [
-            {"role": _role(m), "content": _content(m)}
-            for m in messages
-            if _role(m) in ("user", "assistant")
-        ],
+        "messages": out,
         "ts": tup.checkpoint.get("ts"),
     }
 

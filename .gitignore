@@ -1,5 +1,7 @@
 .env
+.env.mcp
 .venv/
+.venv-mcp/
 __pycache__/
 *.pyc
 logs/
@@ -8,3 +10,6 @@ logs/
 data/checkpoints.db
 data/checkpoints.db-shm
 data/checkpoints.db-wal
+data/mcp_oauth.sqlite
+data/mcp_oauth.sqlite-shm
+data/mcp_oauth.sqlite-wal

@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from pydantic import BaseModel, Field, model_validator
 
 from agents import registry
@@ -27,12 +27,20 @@ class AgentRunRequest(BaseModel):
     input: str | None = Field(
         default=None, description="Single user message (use with thread_id for stateful chats).",
     )
+    images: list[str] | None = Field(
+        default=None,
+        description="Data-URL images attached to this turn (e.g. 'data:image/jpeg;base64,...').",
+    )
     messages: list[ChatMessage] | None = Field(
         default=None, description="Full conversation history (stateless mode).",
     )
     model: str | None = Field(
         default=None,
         description="Override the agent's default model (passed via configurable).",
+    )
+    provider: Literal["openai", "anthropic"] | None = Field(
+        default=None,
+        description="LLM provider to use for this turn (passed via configurable).",
     )
     thread_id: str | None = Field(
         default=None,
@@ -41,13 +49,23 @@ class AgentRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self):
-        if not self.input and not self.messages:
-            raise ValueError("provide 'input' or 'messages'")
+        if not self.input and not self.messages and not self.images:
+            raise ValueError("provide 'input', 'images', or 'messages'")
         return self
+
+    def _multimodal_human(self) -> HumanMessage:
+        blocks: list[dict] = []
+        if self.input:
+            blocks.append({"type": "text", "text": self.input})
+        for url in self.images or []:
+            blocks.append({"type": "image_url", "image_url": {"url": url}})
+        return HumanMessage(content=blocks)
 
     def to_graph_input(self) -> dict:
         # When a thread_id is set, only the new user message is sent — the
         # checkpointer replays prior state and MessagesState's reducer appends.
+        if self.images:
+            return {"messages": [self._multimodal_human()]}
         if self.thread_id and self.input:
             return {"messages": [("user", self.input)]}
         if self.messages:
@@ -65,6 +83,8 @@ class AgentRunRequest(BaseModel):
             )
         if self.model:
             configurable["model"] = self.model
+        if self.provider:
+            configurable["provider"] = self.provider
         return {"configurable": configurable}
 
 

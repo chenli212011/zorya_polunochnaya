@@ -1,16 +1,23 @@
-"""Minimal chat agent: single LLM node, no tools.
+"""Chat agent: single LLM node, no tools.
 
-The OpenAI model is selected per-request via LangGraph's `configurable` config:
+Provider and model are selected per-request via LangGraph's `configurable` config:
 
-    graph.ainvoke(state, config={"configurable": {"model": "gpt-4o-mini"}})
+    graph.ainvoke(
+        state,
+        config={"configurable": {"provider": "anthropic", "model": "claude-sonnet-4-5"}},
+    )
 
-Falls back to `settings.default_openai_model` when no model is configured.
+`provider` is `"openai"` (default) or `"anthropic"`. The latter is used for
+image-bearing turns so vision-capable Claude models can handle them.
+Multimodal content is passed through unchanged — LangChain's provider adapters
+translate `image_url` content blocks to each backend's native shape.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
@@ -24,7 +31,7 @@ SYSTEM_PROMPT = "You are a helpful, concise assistant."
 
 
 @lru_cache(maxsize=16)
-def _get_llm(model: str) -> ChatOpenAI:
+def _get_openai_llm(model: str) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
         api_key=settings.openai_api_key,
@@ -32,14 +39,35 @@ def _get_llm(model: str) -> ChatOpenAI:
     )
 
 
-@register("chat", description="Plain chat agent (OpenAI, model selectable per request)")
+@lru_cache(maxsize=16)
+def _get_anthropic_llm(model: str) -> ChatAnthropic:
+    return ChatAnthropic(
+        model=model,
+        api_key=settings.anthropic_api_key,
+        temperature=0.7,
+    )
+
+
+@register("chat", description="Plain chat agent (OpenAI text / Anthropic vision, selectable per request)")
 def build_chat_agent():
-    if not settings.has_openai:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+    if not (settings.has_openai or settings.has_anthropic):
+        raise RuntimeError("Neither OPENAI_API_KEY nor ANTHROPIC_API_KEY is set")
 
     async def chat_node(state: MessagesState, config: RunnableConfig) -> dict:
-        model = (config.get("configurable") or {}).get("model") or settings.default_openai_model
-        llm = _get_llm(model)
+        cfg = (config.get("configurable") or {})
+        provider = (cfg.get("provider") or "openai").lower()
+
+        if provider == "anthropic":
+            if not settings.has_anthropic:
+                raise RuntimeError("ANTHROPIC_API_KEY is not set")
+            model = cfg.get("model") or settings.default_anthropic_model
+            llm = _get_anthropic_llm(model)
+        else:
+            if not settings.has_openai:
+                raise RuntimeError("OPENAI_API_KEY is not set")
+            model = cfg.get("model") or settings.default_openai_model
+            llm = _get_openai_llm(model)
+
         response = await llm.ainvoke(
             [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
         )
