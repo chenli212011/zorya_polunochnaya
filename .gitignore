@@ -13,3 +13,4 @@ data/checkpoints.db-wal
 data/mcp_oauth.sqlite
 data/mcp_oauth.sqlite-shm
 data/mcp_oauth.sqlite-wal
+static/tunnel.json

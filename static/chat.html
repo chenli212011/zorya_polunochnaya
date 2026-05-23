@@ -5,6 +5,85 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Zorya · Chat</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@14/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <style>
+    /* Pinned synthetic thread for the MCP connector URL.
+       Lives below the regular thread list, sticky at the bottom of the sidebar. */
+    .thread-list-pinned {
+      padding: 0.6rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(167, 139, 250, 0.04);
+    }
+    .thread-list-pinned[hidden] { display: none; }
+    .thread-item-pinned {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.55rem 0.7rem;
+      border-radius: 8px;
+      background: rgba(167, 139, 250, 0.12);
+      border: 1px solid rgba(167, 139, 250, 0.3);
+      cursor: pointer;
+      transition: background 120ms, border-color 120ms;
+      color: rgba(255, 255, 255, 0.92);
+    }
+    .thread-item-pinned:hover {
+      background: rgba(167, 139, 250, 0.22);
+      border-color: rgba(167, 139, 250, 0.5);
+    }
+    .thread-item-pinned.active {
+      background: rgba(167, 139, 250, 0.28);
+      border-color: rgba(167, 139, 250, 0.6);
+    }
+    .thread-pin-icon {
+      width: 16px; height: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent, #a78bfa);
+    }
+    .thread-pin-title { flex: 1; font-weight: 500; }
+    .thread-pin-status {
+      font-size: 0.7rem;
+      color: rgba(255,255,255,0.55);
+      padding: 1px 6px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.12);
+    }
+    .thread-pin-status.online {
+      color: #86efac;
+      border-color: rgba(74, 222, 128, 0.35);
+      background: rgba(74, 222, 128, 0.12);
+    }
+    .thread-pin-status.offline {
+      color: rgba(255, 255, 255, 0.45);
+    }
+    /* Read-only state for the input form when the MCP thread is active */
+    body.mcp-thread-active .chat-input {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+    /* Inline copy button inside the MCP synthetic message */
+    .mcp-copy-btn {
+      display: inline-block;
+      margin-left: 0.5rem;
+      padding: 1px 9px;
+      font: inherit;
+      font-size: 0.78rem;
+      border-radius: 6px;
+      border: 1px solid rgba(167, 139, 250, 0.55);
+      background: rgba(167, 139, 250, 0.22);
+      color: #fff;
+      cursor: pointer;
+      transition: background 120ms, border-color 120ms;
+    }
+    .mcp-copy-btn:hover { background: rgba(167, 139, 250, 0.4); }
+    .mcp-copy-btn.copied {
+      background: rgba(74, 222, 128, 0.4);
+      border-color: rgba(74, 222, 128, 0.7);
+    }
+  </style>
 </head>
 <body>
   <div class="chat-app">
@@ -12,15 +91,28 @@
     <aside class="sidebar">
       <div class="sidebar-header">
         <h2>Conversations</h2>
-        <button class="btn-new" id="new-thread" title="New conversation">+ New</button>
+        <div class="sidebar-actions">
+          <button class="btn-new" id="new-thread" title="New conversation">+ New</button>
+          <button class="btn-icon" id="sidebar-toggle" title="Collapse sidebar" aria-label="Collapse sidebar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 18l-6-6 6-6"/>
+            </svg>
+          </button>
+        </div>
       </div>
       <div class="thread-list" id="thread-list">
         <div class="thread-list-empty">No conversations yet.</div>
       </div>
+      <div class="thread-list-pinned" id="thread-list-pinned" hidden></div>
     </aside>
 
     <section class="chat-pane">
       <header class="chat-header">
+        <button class="btn-icon sidebar-expand" id="sidebar-expand" title="Open sidebar" aria-label="Open sidebar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 18l6-6-6-6"/>
+          </svg>
+        </button>
         <h1>Chat</h1>
         <div class="chat-header-controls">
           <label class="pill pill-select" title="Text model (OpenAI) — used for text-only messages">
@@ -77,9 +169,61 @@
   <div class="bg-toast" id="bg-toast" aria-hidden="true"></div>
 
   <script>
+    // ---- MCP connector synthetic thread ------------------------------------
+    // Pinned at the bottom of the sidebar. On every page load, fetches the
+    // tunnel URL published by start_all.sh and appends a new "utterance" to
+    // a localStorage-backed history. Clicking the pinned thread renders that
+    // history as a read-only conversation.
+
+    const MCP_THREAD_ID = "__mcp_connector__";
+    const MCP_HISTORY_KEY = "zorya.mcpHistory";
+    const MCP_HISTORY_MAX = 10;
+
+    function loadMcpHistory() {
+      try { return JSON.parse(localStorage.getItem(MCP_HISTORY_KEY) || "[]"); }
+      catch { return []; }
+    }
+
+    function saveMcpHistory(arr) {
+      const trimmed = arr.slice(-MCP_HISTORY_MAX);
+      localStorage.setItem(MCP_HISTORY_KEY, JSON.stringify(trimmed));
+    }
+
+    function pushMcpUtterance(url, online) {
+      const arr = loadMcpHistory();
+      arr.push({ ts: new Date().toISOString(), url, online });
+      saveMcpHistory(arr);
+    }
+
+    function formatMcpTime(iso) {
+      const d = new Date(iso);
+      return d.toLocaleString(undefined, {
+        month: "short", day: "numeric",
+        hour: "2-digit", minute: "2-digit",
+      });
+    }
+
+    async function initMcpThread() {
+      try {
+        const r = await fetch("/static/tunnel.json", { cache: "no-store" });
+        if (r.ok) {
+          const data = await r.json();
+          if (data && data.public_url) {
+            pushMcpUtterance(data.public_url, true);
+            return;
+          }
+        }
+      } catch (_) {}
+      // No live tunnel this load; only record "offline" if we have prior history
+      if (loadMcpHistory().length > 0) {
+        pushMcpUtterance(null, false);
+      }
+    }
+
     const AGENT = "chat";
     const STORAGE_KEY = "zorya.currentThreadId";
     const BG_KEY = "zorya.background";
+    const SIDEBAR_KEY = "zorya.sidebarCollapsed";
 
     // ---- background themes --------------------------------------------------
 
@@ -121,6 +265,17 @@
     applyBackground(localStorage.getItem(BG_KEY) || "aurora");
     document.getElementById("bg-toggle").addEventListener("click", cycleBackground);
 
+    // ---- sidebar collapse --------------------------------------------------
+
+    function applySidebarCollapsed(collapsed) {
+      document.body.classList.toggle("sidebar-collapsed", collapsed);
+      localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0");
+    }
+
+    applySidebarCollapsed(localStorage.getItem(SIDEBAR_KEY) === "1");
+    document.getElementById("sidebar-toggle").addEventListener("click", () => applySidebarCollapsed(true));
+    document.getElementById("sidebar-expand").addEventListener("click", () => applySidebarCollapsed(false));
+
     const logLeft = document.getElementById("log-left");
     const logRight = document.getElementById("log-right");
     const form = document.getElementById("form");
@@ -156,6 +311,24 @@
 
     // ---- bubbles ------------------------------------------------------------
 
+    function renderMarkdown(text) {
+      if (!text) return "";
+      if (typeof marked === "undefined" || typeof DOMPurify === "undefined") {
+        const tmp = document.createElement("div");
+        tmp.textContent = text;
+        return tmp.innerHTML;
+      }
+      return DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }));
+    }
+
+    function setBubbleText(b, text) {
+      if (b.role === "assistant") {
+        b.content.innerHTML = renderMarkdown(text);
+      } else {
+        b.content.textContent = text;
+      }
+    }
+
     function bubble(log, role, text = "", images = []) {
       const el = document.createElement("div");
       el.className = `msg ${role}`;
@@ -171,13 +344,14 @@
         img.alt = "attachment";
         el.appendChild(img);
       }
-      const c = document.createElement("span");
+      const c = document.createElement("div");
       c.className = "content";
-      c.textContent = text;
       el.appendChild(c);
       log.appendChild(el);
+      const b = { el, content: c, role };
+      setBubbleText(b, text);
       log.scrollTop = log.scrollHeight;
-      return { el, content: c };
+      return b;
     }
 
     function showError(msg) {
@@ -216,7 +390,7 @@
     async function fillTranslated(bubbleObj, text, target) {
       bubbleObj.el.classList.add("streaming");
       try {
-        bubbleObj.content.textContent = await translate(text, target);
+        setBubbleText(bubbleObj, await translate(text, target));
       } catch (err) {
         bubbleObj.content.textContent = `[translation error: ${err.message}]`;
         bubbleObj.el.classList.add("error");
@@ -240,10 +414,92 @@
       currentThreadId = id;
       if (id) localStorage.setItem(STORAGE_KEY, id);
       else localStorage.removeItem(STORAGE_KEY);
-      // update active state in sidebar
-      for (const el of threadList.querySelectorAll(".thread-item")) {
+      // Update active state across both the regular and pinned thread items
+      for (const el of document.querySelectorAll(".thread-item, .thread-item-pinned")) {
         el.classList.toggle("active", el.dataset.threadId === id);
       }
+      const isMcp = id === MCP_THREAD_ID;
+      document.body.classList.toggle("mcp-thread-active", isMcp);
+      input.placeholder = isMcp
+        ? "Read-only system conversation"
+        : "Type a message… (Enter to send, Shift+Enter for newline)";
+    }
+
+    // ---- MCP synthetic conversation rendering -----------------------------
+
+    function renderMcpConversation() {
+      clearLogs();
+      history = [];
+      const hist = loadMcpHistory();
+      if (!hist.length) {
+        bubble(logLeft, "assistant",
+          "_No MCP tunnel URL has been published yet. Run `./start_all.sh` to start the tunnel._");
+        return;
+      }
+      for (let i = 0; i < hist.length; i++) {
+        const { ts, url, online } = hist[i];
+        const isLast = i === hist.length - 1;
+        const time = formatMcpTime(ts);
+        let text;
+        if (online && isLast) {
+          text = `**Current MCP connector URL** _(updated ${time})_:\n\n\`${url}\`\n\nPaste this into **claude.ai → Settings → Connectors → Add custom connector**.`;
+        } else if (online) {
+          text = `_${time}_ — \`${url}\``;
+        } else {
+          text = `_${time}_ — tunnel offline (run \`./start_all.sh\` to bring it back up)`;
+        }
+        const b = bubble(logLeft, "assistant", text);
+        if (online && isLast && url) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "mcp-copy-btn";
+          btn.textContent = "Copy URL";
+          btn.addEventListener("click", async () => {
+            try {
+              await navigator.clipboard.writeText(url);
+              btn.textContent = "Copied!";
+              btn.classList.add("copied");
+              setTimeout(() => { btn.textContent = "Copy URL"; btn.classList.remove("copied"); }, 1200);
+            } catch (_) {}
+          });
+          b.content.appendChild(btn);
+        }
+      }
+    }
+
+    function renderMcpPinned() {
+      const container = document.getElementById("thread-list-pinned");
+      container.innerHTML = "";
+      const hist = loadMcpHistory();
+      if (!hist.length) {
+        container.hidden = true;
+        return;
+      }
+      const last = hist[hist.length - 1];
+      container.hidden = false;
+
+      const item = document.createElement("div");
+      item.className = "thread-item-pinned";
+      item.dataset.threadId = MCP_THREAD_ID;
+      if (currentThreadId === MCP_THREAD_ID) item.classList.add("active");
+
+      const icon = document.createElement("span");
+      icon.className = "thread-pin-icon";
+      icon.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 1 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 1 0 7.07 7.07l1.72-1.71"/></svg>`;
+      item.appendChild(icon);
+
+      const title = document.createElement("span");
+      title.className = "thread-pin-title";
+      title.textContent = "MCP Connector";
+      item.appendChild(title);
+
+      const status = document.createElement("span");
+      status.className = "thread-pin-status " + (last.online ? "online" : "offline");
+      status.textContent = last.online ? "online" : "offline";
+      item.appendChild(status);
+
+      item.addEventListener("click", () => loadThread(MCP_THREAD_ID));
+      container.appendChild(item);
     }
 
     function renderThreadList(threads) {
@@ -299,6 +555,11 @@
     }
 
     async function loadThread(threadId) {
+      if (threadId === MCP_THREAD_ID) {
+        setCurrentThread(MCP_THREAD_ID);
+        renderMcpConversation();
+        return;
+      }
       try {
         const resp = await fetch(`/api/threads/${encodeURIComponent(threadId)}`);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -318,13 +579,9 @@
     }
 
     function startNewThread() {
-      currentThreadId = null;
-      localStorage.removeItem(STORAGE_KEY);
+      setCurrentThread(null);
       history = [];
       clearLogs();
-      for (const el of threadList.querySelectorAll(".thread-item")) {
-        el.classList.remove("active");
-      }
       input.focus();
     }
 
@@ -498,7 +755,7 @@
               const payload = JSON.parse(data);
               if (payload.type === "token") {
                 acc += payload.content;
-                asstLeft.content.textContent = acc;
+                setBubbleText(asstLeft, acc);
                 logLeft.scrollTop = logLeft.scrollHeight;
               } else if (payload.type === "error") {
                 throw new Error(payload.error);
@@ -537,6 +794,7 @@
 
     form.addEventListener("submit", (e) => {
       e.preventDefault();
+      if (currentThreadId === MCP_THREAD_ID) return;  // read-only
       const text = input.value.trim();
       if (!text || sendBtn.disabled) return;
       input.value = "";
@@ -554,7 +812,9 @@
 
     (async () => {
       populateVisionModels();
+      await initMcpThread();  // emits a fresh utterance on each page load
       await Promise.all([loadModels(), loadLanguages(), refreshThreads()]);
+      renderMcpPinned();
       if (currentThreadId) {
         await loadThread(currentThreadId).catch(() => startNewThread());
       }

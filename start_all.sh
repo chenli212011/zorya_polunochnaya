@@ -21,6 +21,13 @@ MCP_LOG="$LOG_DIR/mcp-server.log"
 
 mkdir -p "$LOG_DIR"
 
+# Kill any orphan tail processes from previous runs that may still be
+# tailing the same log files — otherwise every line of new output gets
+# printed once per orphan.
+pkill -f "tail -F $APP_LOG"    2>/dev/null || true
+pkill -f "tail -F $TUNNEL_LOG" 2>/dev/null || true
+pkill -f "tail -F $MCP_LOG"    2>/dev/null || true
+
 APP_PID=""
 TUNNEL_PID=""
 MCP_PID=""
@@ -71,6 +78,8 @@ cleanup() {
   for pid in "$APP_PID" "$TUNNEL_PID" "$MCP_PID"; do
     [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
   done
+  # Remove the published tunnel URL so the UI banner disappears
+  rm -f static/tunnel.json 2>/dev/null || true
   wait 2>/dev/null || true
   echo "[shutdown] Done."
 }
@@ -129,6 +138,14 @@ if [ -z "$TUNNEL_URL" ]; then
 fi
 echo "[setup] Tunnel ready    (pid $TUNNEL_PID)  → $TUNNEL_URL"
 
+# Publish the URL so the chat UI can show it. The main app serves /static/*
+# so /static/tunnel.json is reachable at http://localhost:$APP_PORT/static/tunnel.json
+mkdir -p static
+printf '{"public_url":"%s","started_at":"%s"}\n' "$TUNNEL_URL" "$(date -u +%FT%TZ)" > static/tunnel.json
+
+# Also drop it on the macOS clipboard for one-click pasting into claude.ai
+printf '%s' "$TUNNEL_URL" | pbcopy 2>/dev/null && echo "[setup] Tunnel URL copied to clipboard" || true
+
 # ----- 3. MCP server --------------------------------------------------------
 
 echo "[setup] Starting MCP server on :$MCP_PORT (MCP_PUBLIC_URL=$TUNNEL_URL)"
@@ -155,9 +172,11 @@ cat <<BANNER
   Tunnel URL:  $TUNNEL_URL
 
   >>> Paste this URL into claude.ai → Settings → Connectors → Add custom
-      connector:
+      connector (already copied to clipboard):
 
           $TUNNEL_URL
+
+      Also visible at the top of http://localhost:$APP_PORT/chat
 
   Logs:
     [app]     $APP_LOG
